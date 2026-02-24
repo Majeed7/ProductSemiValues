@@ -2,10 +2,15 @@ import math
 import time
 import numpy as np
 
-# Optional (only needed for the JAX method)
+"""Explainer backends for product-form kernels.
+
+Provides ProductKernelLocalExplainer and RBFLocalExplainer that compute
+per-feature Shapley values using multiple numerical backends (NumPy/JAX).
+"""
+
+from product_games_shapley import ProductGamesShapleyNumpy, ProductGamesShapleyJax
+
 try:
-    # import os
-    # os.environ["JAX_PLATFORM_NAME"] = "cpu"
     import jax
     import jax.numpy as jnp
     from jax import lax
@@ -19,15 +24,87 @@ from sklearn.metrics.pairwise import rbf_kernel
 
 
 class ProductKernelLocalExplainer:
-    """
-    Base class for product-kernel local explanations (k-1 factorization).
-    Supports multiple computation backends for the Shapley integral identity.
-    """
+    '''
+    ProductKernelLocalExplainer(model)
+    Base class for computing local (per-instance) Shapley-style explanations
+    for models with product-form feature kernels (e.g., RBF product kernels).
+    Implements utilities to extract training data and dual coefficients from
+    various scikit-learn-style estimators, compute feature-wise kernel vectors,
+    precompute combinatorial Shapley weights, and evaluate per-feature Shapley
+    values via multiple numerical backends.
+    Key concepts and conventions
+    - The explanation is based on a k-1 factorization of a product kernel:
+        K_prod(x, X_train) = \prod_{j=0}^{d-1} k_j(x_j, X_train[:, j]).
+        For numerical stability the implementation works with shifted per-feature
+        kernels K_j = k_j(x_j, X_train[:, j]) - 1.
+    - Shapes:
+            X_train : (n, d)      -- training inputs stored by the wrapped model
+            alpha   : (n,)        -- dual coefficients or equivalent weight vector
+            K       : (d, n)      -- shifted per-feature kernel values (k - 1)
+            explain(...) -> (d,)  -- returned per-feature Shapley values
+    - The attribute null_game stores the model baseline / intercept when available.
+    Parameters
+    - model: A fitted scikit-learn compatible estimator using a kernel that
+        factorizes across features (examples: SVM/SVR, KernelRidge, GaussianProcessRegressor,
+        GaussianProcessClassifier wrappers). The class probes common attributes:
+        support_vectors_, X_fit_, X_train_, base_estimator_.X_train_, dual_coef_,
+        alpha_, intercept_. If the wrapped estimator does not expose these attributes
+        a ValueError is raised when attempting to extract data.
+    Public methods
+    - get_X_train():
+            Return the training inputs (n, d) by inspecting the wrapped model.
+            Raises ValueError for unsupported estimator structures.
+    - get_alpha():
+            Extracts the model's dual coefficients / alpha vector (n,) and sets
+            self.null_game when the model exposes an intercept or when an analytic
+            baseline can be derived. Raises ValueError for unsupported estimator types.
+    - precompute_mu(d: int) -> np.ndarray:
+            Static helper returning Shapley combinatorial weights mu[q] =
+            q! (d-q-1)! / d! for q in 0..d-1. Returns a 1-D array of length d.
+    - compute_kernel_vectors(X, x, gamma) -> list[np.ndarray]:
+            Compute per-feature kernel vectors k_j(x_j, X[:, j]) for j=0..d-1.
+            Returns a list of d arrays each of shape (n,). By default this calls an
+            RBF kernel per feature; subclasses may override for different kernels.
+    - explain(x, gamma, method='logspace_jax', m_q=None) -> np.ndarray:
+            Compute per-feature Shapley values for a single instance x.
+            Parameters:
+                x      : (d,) input instance to explain
+                gamma  : kernel hyperparameter passed to per-feature kernel computation
+                method : one of
+                                 {'logspace_numpy', 'logspace_jax',
+                                    'prefix_scan_numpy', 'prefix_scan_jax'}
+                                 selecting the numerical backend for Gauss–Legendre integration
+                                 and stability strategy (log-space vs prefix/suffix scan).
+                m_q    : number of Gauss–Legendre nodes. If None, set to ceil(d/2)
+                                 (exactness for polynomials up to degree d-1).
+            Returns:
+                numpy array of shape (d,) containing the per-feature Shapley values.
+            Raises:
+                ValueError for unknown method or when model interrogation fails.
+    Notes and implementation details
+    - The class is kernel-agnostic at the API level but the default compute_kernel_vectors
+        uses an RBF call per feature; subclasses (e.g., RBFLocalExplainer) can infer
+        or manage gamma automatically.
+    - The implemention expects the model's prediction to admit a linear expansion
+        in duals: f(x) = sum_i alpha_i * prod_j k_j(x_j, X_train[i,j]) + constant.
+        The explain routine forms a phi matrix of per-feature contributions
+        (d, n) via numerical integration (Gauss–Legendre) and returns
+        feature-wise sums (phi * alpha). Different backends trade numerical stability
+        and performance (NumPy vs JAX, log-domain vs prefix-scan).
+    - This class does not modify the wrapped model; it only reads required attributes.
+    - For large n or d choose the backend and m_q to balance accuracy and performance.
+    Example (conceptual)
+            explainer = ProductKernelLocalExplainer(fitted_model)
+            shap_vals = explainer.explain(x_instance, gamma=0.5, method='logspace_numpy')
+    '''
+
 
     def __init__(self, model):
-        """
+        """Create an explainer for a fitted kernel model.
+
         Args:
-            model: scikit-learn model (SVM/SVR/KRR/GP) with an RBF-like product kernel
+            model: fitted scikit-learn estimator exposing training data and
+                dual coefficients (support_vectors_, X_fit_, X_train_, alpha_, dual_coef_, etc.).
         """
         self.model = model
         self.X_train = self.get_X_train()
@@ -35,37 +112,41 @@ class ProductKernelLocalExplainer:
         self.n, self.d = self.X_train.shape
         self.null_game = 0.0  # set in get_alpha() when applicable
 
-    # -------------------- model plumbing --------------------
-
     def get_X_train(self):
-        if hasattr(self.model, "support_vectors_"):      # SVM/SVR
+        """Return training inputs (n, d) from the wrapped model.
+
+        Probes common scikit-learn attributes and raises ValueError if none match.
+        """
+        if hasattr(self.model, "support_vectors_"):
             return self.model.support_vectors_
-        if hasattr(self.model, "X_fit_"):                # KernelRidge
+        if hasattr(self.model, "X_fit_"):
             return self.model.X_fit_
-        if hasattr(self.model, "X_train_"):              # GPR (sklearn<=1.5)
+        if hasattr(self.model, "X_train_"):
             return self.model.X_train_
-        if hasattr(self.model, "base_estimator_") and hasattr(self.model.base_estimator_, "X_train_"):  # GPC
+        if hasattr(self.model, "base_estimator_") and hasattr(self.model.base_estimator_, "X_train_"):
             return self.model.base_estimator_.X_train_
         raise ValueError("Unsupported model type for Shapley value computation (X_train).")
 
     def get_alpha(self):
-        if hasattr(self.model, "dual_coef_"):  # SVM/SVR
+        """
+        Extract dual coefficients (alpha) and set `null_game` when available.
+
+        Returns an (n,) NumPy array.
+        """
+        if hasattr(self.model, "dual_coef_"):
             self.null_game = float(np.asarray(self.model.intercept_).ravel()[0])
             return np.asarray(self.model.dual_coef_, dtype=np.float64).ravel()
 
-        if hasattr(self.model, "alpha_"):      # GPR: alpha_ = K^{-1} y (size n)
+        if hasattr(self.model, "alpha_"):
             alpha = np.asarray(self.model.alpha_, dtype=np.float64).ravel()
             self.null_game = float(np.sum(alpha))
             return alpha
 
         if hasattr(self.model, "dual_coef_") and hasattr(self.model, "intercept_"):
-            # fallback for other dual models
             self.null_game = float(np.asarray(self.model.intercept_).ravel()[0])
             return np.asarray(self.model.dual_coef_, dtype=np.float64).ravel()
 
         raise ValueError("Unsupported model type for Shapley value computation (alpha).")
-
-    # -------------------- combinatorial coefficients --------------------
 
     @staticmethod
     def precompute_mu(d: int) -> np.ndarray:
@@ -74,204 +155,6 @@ class ProductKernelLocalExplainer:
         """
         unnormalized = [(math.factorial(q) * math.factorial(d - q - 1)) for q in range(d)]
         return np.array(unnormalized) / math.factorial(d)
-
-    # -------------------- ESP (dynamic programming) --------------------
-
-    @staticmethod
-    def compute_elementary_symmetric_polynomials(kernel_vectors, scale: bool = False):
-        """
-        DP for ESPs e_q over feature-wise vectors k_j (each shape (m,)).
-        Returns list [e_0,...,e_d], each shape (m,).
-        """
-        max_abs_k = 1.0
-        if scale:
-            max_abs_k = max(np.max(np.abs(k)) for k in kernel_vectors) or 1.0
-        scaled_kernel = [k / max_abs_k for k in kernel_vectors]
-
-        e = [np.ones_like(scaled_kernel[0], dtype=np.float64)]
-        for k in scaled_kernel:
-            new_e = [np.zeros_like(e[0])] * (len(e) + 1)
-            new_e[0] = -k * e[0]
-            for i in range(1, len(e)):
-                new_e[i] = e[i - 1] - k * e[i]
-            new_e[len(e)] = e[-1].copy()
-            e = new_e
-
-        n = len(scaled_kernel)
-        elementary = [np.ones_like(e[0])]
-        for r in range(1, n + 1):
-            sign = (-1) ** r
-            elementary.append(sign * e[n - r] * (max_abs_k ** r))
-        return elementary
-
-    # -------------------- Gauss–Legendre backends --------------------
-
-    @staticmethod
-    def logspace_numpy(K: np.ndarray, alpha: np.ndarray, m_q: int):
-        """
-        Memory-lean, log-space shared product.
-        K: (d,m), alpha: (m,), returns (d,)
-        """
-        K = np.asarray(K, dtype=np.float64)
-        alpha = np.asarray(alpha, dtype=np.float64)
-        d, m = K.shape
-
-        # Nodes/weights on [0,1]
-        x, w = np.polynomial.legendre.leggauss(m_q)
-        x = 0.5 * (x + 1.0)
-        w = 0.5 * w
-
-        # Shared product per node&column in log-space
-        log_abs_P = np.zeros((m_q, m), dtype=np.float64)
-        sign_P = np.ones((m_q, m), dtype=np.float64)
-
-        eps = 1e-12
-        for j in range(d):
-            t = 1.0 + np.outer(x, K[j, :])  # (m_q, m)
-            sign_P *= np.sign(t)
-            log_abs_P += np.log(np.maximum(np.abs(t), eps), dtype=np.float64)
-
-        result = np.zeros(d, dtype=np.float64)
-        wa = w[:, None]                      # (m_q,1)
-        a = alpha[None, :]                   # (1,m)
-        for i in range(d):
-            denom = 1.0 + np.outer(x, K[i, :])  # (m_q, m)
-            integrand_sign = sign_P * np.sign(denom)
-            integrand_log = log_abs_P - np.log(np.maximum(np.abs(denom), eps), dtype=np.float64)
-            Qint = (wa * (integrand_sign * np.exp(integrand_log))).sum(axis=0)  # (m,)
-            result[i] = (K[i, :] * a * Qint).sum()
-        return result
-
-    # ---- JAX wrapper for log space method ----
-    @staticmethod
-    @jax.jit
-    def _gauss_shared_jax_core(K, alpha, x, w, eps):
-        """
-        JIT-safe pure core: all args are arrays or scalars, no `self`.
-        K: (d,m)  alpha: (m,)  x:(m_q,), w:(m_q,)
-        returns: (d,)
-        """
-        # reshape nodes/weights for broadcasting
-        x = x[:, None]      # (m_q,1)
-        w = w[:, None]      # (m_q,1)
-
-        d, m = K.shape
-        # 1) shared product over features in log-space via scan across feature axis
-        def scan_step(carry, k_j):
-            log_abs_P, sign_P = carry                # both (m_q,m)
-            t = 1.0 + x * k_j[None, :]              # (m_q,m)
-            sign_P = sign_P * jnp.sign(t)
-            log_abs_P = log_abs_P + jnp.log(jnp.maximum(jnp.abs(t), eps))
-            return (log_abs_P, sign_P), None
-
-        init = (jnp.zeros((x.shape[0], m), K.dtype),
-                jnp.ones((x.shape[0], m), K.dtype))
-        (log_abs_P, sign_P), _ = lax.scan(scan_step, init, K)
-
-        # 2) per-feature division & integration, vectorized with vmap
-        def per_feature(k_i):
-            denom = 1.0 + x * k_i[None, :]            # (m_q,m)
-            integrand_sign = sign_P * jnp.sign(denom)
-            integrand_log  = log_abs_P - jnp.log(jnp.maximum(jnp.abs(denom), eps))
-            Qint = jnp.sum(w * (integrand_sign * jnp.exp(integrand_log)), axis=0)  # (m,)
-            return jnp.sum(k_i * alpha * Qint)        # scalar
-
-        return jax.vmap(per_feature, in_axes=0)(K)     # (d,)
-
-    def logspace_jax(self, K, alpha, m_q: int, eps: float = 1e-100):
-        """
-        Non-jitted wrapper: builds GL nodes/weights and calls the jitted core.
-        K: (d,m) numpy/jax array, alpha: (m,)
-        """
-        # Choose dtype: prefer f32 on accelerators
-        dtype = jnp.result_type(getattr(K, 'dtype', jnp.float32),
-                                getattr(alpha, 'dtype', jnp.float32),
-                                jnp.float32)
-        # Build Gauss–Legendre nodes/weights on [0,1] in NumPy, then to JAX
-        x_np, w_np = np.polynomial.legendre.leggauss(m_q)
-        x_np = 0.5 * (x_np + 1.0)      # map to [0,1]
-        w_np = 0.5 * w_np
-
-        x = jnp.asarray(x_np, dtype=dtype)
-        w = jnp.asarray(w_np, dtype=dtype)
-        Kj = jnp.asarray(K, dtype=dtype)
-        aj = jnp.asarray(alpha, dtype=dtype)
-
-        out = self._gauss_shared_jax_core(Kj, aj, x, w, eps)
-        return np.asarray(out)
-
-    # ------ Prefix/suffix Gauss–Legendre backend ------
-    @staticmethod
-    def prefix_scan_numpy(K: np.ndarray, alpha: np.ndarray, m_q: int):
-        """
-        Fully vectorized prefix/suffix per quadrature node (NumPy).
-        K: (d,m), alpha: (m,), returns (d,)
-        """
-        K = np.asarray(K, dtype=np.float64)
-        alpha = np.asarray(alpha, dtype=np.float64)
-        d, m = K.shape
-
-        x, w = np.polynomial.legendre.leggauss(m_q)
-        x = 0.5 * (x + 1.0)
-        w = 0.5 * w
-
-        X = x[:, None, None]                 # (m_q,1,1)
-        B = 1.0 + X * K[None, :, :]          # (m_q, d, m)
-
-        pref = np.cumprod(B, axis=1)
-        pref = np.concatenate([np.ones((B.shape[0], 1, m), B.dtype), pref[:, :-1, :]], axis=1)
-
-        suf = np.cumprod(B[:, ::-1, :], axis=1)[:, ::-1, :]
-        suf = np.concatenate([suf[:, 1:, :], np.ones((B.shape[0], 1, m), B.dtype)], axis=1)
-
-        Q_no_i = pref * suf                  # (m_q, d, m)
-        acc_vec = (w[:, None, None] * Q_no_i).sum(axis=0)  # (d, m)
-        return (K * acc_vec * alpha[None, :]).sum(axis=1)
-
-    # ---- JAX version of Prefix/suffix ----
-    @staticmethod
-    def _jax_core(K, alpha, x, w):
-        B = 1.0 + x[:, None, None] * K[None, :, :]  # (m_q,d,m)
-        pref = lax.cumprod(B, axis=1)
-        pref = jnp.concatenate([jnp.ones((B.shape[0], 1, B.shape[2]), dtype=B.dtype), pref[:, :-1, :]], axis=1)
-        suf = lax.cumprod(B[:, ::-1, :], axis=1)[:, ::-1, :]
-        suf = jnp.concatenate([suf[:, 1:, :], jnp.ones((B.shape[0], 1, B.shape[2]), dtype=B.dtype)], axis=1)
-        Q = pref * suf
-        acc = (w[:, None, None] * Q).sum(axis=0)    # (d,m)
-        return (K * acc * alpha[None, :]).sum(axis=1)  # (d,)
-
-    @staticmethod
-    def prefix_scan_jax(K: np.ndarray, alpha: np.ndarray, m_q: int):
-        """
-        JAX/XLA prefix/suffix backend.
-        """
-        if not JAX_AVAILABLE:
-            raise RuntimeError("JAX is not available on this system.")
-        # Nodes/weights on [0,1]
-        x_np, w_np = np.polynomial.legendre.leggauss(m_q)
-        x_np = 0.5 * (x_np + 1.0)
-        w_np = 0.5 * w_np
-
-        # dtype policy: prefer float32 on accelerators
-        dtype = np.result_type(K.dtype, alpha.dtype, np.float32)
-        try:
-            platforms = {dev.platform for dev in jax.devices()}
-        except Exception:
-            platforms = set()
-        if (jax.default_backend() != "cpu") or (platforms & {"gpu", "tpu", "metal"}):
-            dtype = np.float32
-            K = K.astype(np.float32, copy=False)
-            alpha = alpha.astype(np.float32, copy=False)
-        x = jnp.asarray(x_np, dtype=dtype)
-        w = jnp.asarray(w_np, dtype=dtype)
-        Kj = jnp.asarray(K, dtype=dtype)
-        aj = jnp.asarray(alpha, dtype=dtype)
-
-        _jit_core = jax.jit(ProductKernelLocalExplainer._jax_core)
-        out = _jit_core(Kj, aj, x, w)
-        return np.asarray(out)
-
-    # -------------------- high-level API --------------------
 
     def compute_kernel_vectors(self, X, x, gamma):
         """
@@ -283,64 +166,50 @@ class ProductKernelLocalExplainer:
             kvs.append(kv)
         return kvs
 
-    def explain(self, x, gamma, method: str = 'esp-collective', m_q: int | None = None):
+    def explain(self, x, gamma, method: str = 'logspace_jax', m_q: int | None = None):
         """
         Compute per-feature Shapley values for one instance x using selected backend.
 
-        method ∈ {'esp-collective', 'gauss-shared', 'gauss-prefix', 'gauss-jax'}
+        method ∈ {'logspace_numpy', 'logspace_jax', 'prefix_scan_numpy', 'prefix_scan_jax'}
         m_q   : Gauss–Legendre nodes (if None, uses ceil(d/2) for exactness on degree d-1)
         """
-        # 1) feature-wise kernel vectors and shifted K = k-1
-        kernel_vectors = self.compute_kernel_vectors(self.X_train, x, gamma)  # list of length d, each (n,)
-        K = np.asarray(kernel_vectors, dtype=np.float64) - 1.0               # (d, n)
+        kernel_vectors = self.compute_kernel_vectors(self.X_train, x, gamma)
+        K = np.asarray(kernel_vectors, dtype=np.float64) - 1.0
         alpha = np.asarray(self.alpha, dtype=np.float64)
         d = self.d
 
         if m_q is None:
             m_q = (d + 1) // 2  # exactness for degree (d-1)
 
-        if method == 'esp-collective':
-            # Global ESPs E[0..d] (each (n,))
-            E = np.zeros((d + 1, K.shape[1]), dtype=np.float64)
-            E[0] = 1.0
-            # Note: here K means (k_j - 1). For ESPs we need k_j (not K),
-            # so use (K+1).
-            Kp1 = K + 1.0
-            for j in range(d):
-                for q in range(j + 1, 0, -1):
-                    E[q] += Kp1[j] * E[q - 1]
-            mu = self.precompute_mu(d)
-
-            # For each i: synthetic division recurrence
-            shap = np.zeros(d, dtype=np.float64)
-            for i in range(d):
-                k_i = Kp1[i]
-                e_prev = np.ones_like(k_i)       # e^{(-i)}_0
-                total = mu[0] * e_prev
-                for q in range(1, d):
-                    e_curr = E[q] - k_i * e_prev
-                    total += mu[q] * e_curr
-                    e_prev = e_curr
-                shap[i] = (alpha * (Kp1[i] - 1.0) * total).sum()  # (k_i-1) * sum_q mu[q] e^{(-i)}_q
-            return shap
-
         ## log space Gauss–Legendre backends
         elif method == 'logspace_numpy':
-            return self.logspace_numpy(K, alpha, m_q)
-        
+            phi = ProductGamesShapleyNumpy().phi_matrix_logspace(K, m_q)
+            out = (phi * alpha[None, :]).sum(axis=1)
+            
+            return out
+
         elif method == 'logspace_jax':
-            return self.logspace_jax(K, alpha, m_q)
+            phi = ProductGamesShapleyJax().phi_matrix_logspace(K, m_q)
+            out = (phi * alpha[None, :]).sum(axis=1)
+            
+            return out
 
         ## prefix /suffix Gauss Legendre backends
         elif method == 'prefix_scan_numpy':
-            return self.prefix_scan_numpy(K, alpha, m_q)
+            phi = ProductGamesShapleyNumpy().phi_matrix_prefix_scan(K, m_q)
+            out = (phi * alpha[None, :]).sum(axis=1)
+            
+            return out
 
         elif method == 'prefix_scan_jax':
-            return self.prefix_scan_jax(K, alpha, m_q)
+            phi = ProductGamesShapleyJax().phi_matrix_prefix_scan(K, m_q)
+            out = (phi * alpha[None, :]).sum(axis=1)
+            
+            return out
         
         else:
             raise ValueError("Unknown method. Choose from "
-                             "{'esp-collective','gauss-shared','gauss-prefix','gauss-jax'}.")
+                             "{'logspace_numpy','logspace_jax','prefix_scan_numpy','prefix_scan_jax'}.")
 
 
 class RBFLocalExplainer(ProductKernelLocalExplainer):
@@ -353,21 +222,23 @@ class RBFLocalExplainer(ProductKernelLocalExplainer):
         self.gamma = self.get_gamma()
 
     def get_gamma(self):
-        if hasattr(self.model, "_gamma"):            # SVM/SVR
+        """Infer an RBF `gamma` value from common model attributes.
+
+        Returns a scalar gamma (1 / (2 * length_scale^2)) when available,
+        or raises ValueError if it cannot be inferred.
+        """
+        if hasattr(self.model, "_gamma"):
             return float(self.model._gamma)
 
-        if hasattr(self.model, "gamma"):             # KernelRidge
+        if hasattr(self.model, "gamma"):
             g = self.model.gamma
             if g is not None:
                 return float(g)
-            # default 'scale' fallback: 1 / n_features
             if getattr(self.model, "kernel", None) == "rbf":
                 return 1.0 / self.model.X_fit_.shape[1]
 
-        # GPR with RBF kernel: kernel_.length_scale may be scalar or array
         if hasattr(self.model, "kernel_") and hasattr(self.model.kernel_, "length_scale"):
             ls = self.model.kernel_.length_scale
-            # length_scale can be scalar or vector; we interpret gamma = 1 / (2 * ls^2)
             ls2 = np.mean(np.asarray(ls, dtype=np.float64) ** 2)
             return float(1.0 / (2.0 * ls2))
 
@@ -379,8 +250,6 @@ class RBFLocalExplainer(ProductKernelLocalExplainer):
                                method=method,
                                m_q=m_q)
 
-
-# -------------------- Benchmark script --------------------
 if __name__ == "__main__":
     from sklearn.gaussian_process import GaussianProcessRegressor
     from sklearn.gaussian_process.kernels import RBF
@@ -388,14 +257,9 @@ if __name__ == "__main__":
     from sklearn.model_selection import train_test_split
     from sklearn.kernel_ridge import KernelRidge
 
-    # --- DATA ---
-    # WARNING: A GPR scales ~O(n^3). Large n or many restarts can be slow.
-    # The user example uses 10,000 features. That is fine for per-feature kernel-vector work,
-    # but model fitting time/memory for GPR may dominate. Adjust as needed.
-    X, y = make_regression(n_samples=1000, n_features=500, random_state=40)
+    X, y = make_regression(n_samples=500, n_features=100, random_state=40)
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.1, random_state=42)
 
-    # --- MODEL: Gaussian Process Regressor ---
     kernel = RBF(1.0, (1e-3, 1e3))
     gpr = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=0, alpha=1e-2, normalize_y=False)
     print("Fitting GPR...")
@@ -403,22 +267,19 @@ if __name__ == "__main__":
     gpr.fit(X_train, y_train)
     print(f"GPR fit time: {time.time()-t0:.3f}s  |  learned kernel: {gpr.kernel_}")
 
-    # --- Explainer ---
     explainer = RBFLocalExplainer(gpr)
-    x = X_test[0]
+    x = X_train[0]
 
     methods = [
-        ("esp-collective", True),
         ("logspace_numpy", True),
         ("logspace_jax", True),
         ("prefix_scan_numpy", True),
-        ("prefix_scan_jax", JAX_AVAILABLE),
+        ("prefix_scan_jax", True),
     ]
 
-    # choose m_q (Gauss nodes); for exactness on degree (d-1), m_q=ceil(d/2) is huge for d=10k.
-    # Use a practical cap (e.g., 32 or 64). You can tune this.
-    m_q = 100
+    m_q = 150
 
+    print("the sume should be: ", gpr.alpha_.sum() - gpr.predict([x]))
     results = {}
     print("\nBenchmarking methods on a single instance...")
     for name, enabled in methods:
@@ -432,4 +293,3 @@ if __name__ == "__main__":
         print(f"  - {name:14s} : time = {dt:.3f}s | sum(phi)={np.sum(vals):.6g}")
 
     print("done.")
-    # --- Compare with Kernel Ridge (optional) ---
