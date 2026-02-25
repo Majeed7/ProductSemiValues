@@ -25,15 +25,15 @@ class ProductGamesShapleyNumpy:
     """
     Alpha-free product-game Shapley factors in NumPy.
 
-    This class operates on the product-game array K of shape (d, m).
-    It returns a matrix Phi of shape (d, m) such that for any coefficients
+    This class operates on the product-game array K of shape (m, d).
+    It returns a matrix Phi of shape (m, d) such that for any coefficients
     alpha of shape (m,), the Shapley values are:
 
-        shapley = (Phi * alpha[None, :]).sum(axis=1)
+        shapley = (Phi * alpha[:, None]).sum(axis=0)
 
     Here K is the per-feature factor used inside the product:
 
-        v_S(m) = prod_{j in S} (1 + K[j, m])    (up to your model-specific shift)
+        v_S(m) = prod_{j in S} (1 + K[m, j])    (up to your model-specific shift)
 
     The implementations match the backends in `explainer.py` but do not depend
     on any model or kernel; they only require K and quadrature size m_q.
@@ -41,33 +41,33 @@ class ProductGamesShapleyNumpy:
 
     def phi_matrix_prefix_scan(self, K: np.ndarray, m_q: int) -> np.ndarray:
         K = np.asarray(K, dtype=np.float64)
-        d, m = K.shape
+        m, d = K.shape
 
         x, w = _gauss_legendre_01_numpy(m_q, dtype=np.float64)
         X = x[:, None, None]  # (m_q,1,1)
-        B = 1.0 + X * K[None, :, :]  # (m_q,d,m)
+        B = 1.0 + X * K[None, :, :]  # (m_q, m, d)
 
-        pref = np.cumprod(B, axis=1)
+        pref = np.cumprod(B, axis=2)
         pref = np.concatenate(
-            [np.ones((B.shape[0], 1, m), dtype=B.dtype), pref[:, :-1, :]], axis=1
+            [np.ones((B.shape[0], m, 1), dtype=B.dtype), pref[:, :, :-1]], axis=2
         )
 
-        suf = np.cumprod(B[:, ::-1, :], axis=1)[:, ::-1, :]
+        suf = np.cumprod(B[:, :, ::-1], axis=2)[:, :, ::-1]
         suf = np.concatenate(
-            [suf[:, 1:, :], np.ones((B.shape[0], 1, m), dtype=B.dtype)], axis=1
+            [suf[:, :, 1:], np.ones((B.shape[0], m, 1), dtype=B.dtype)], axis=2
         )
 
-        Q_no_i = pref * suf  # (m_q,d,m)
-        acc = (w[:, None, None] * Q_no_i).sum(axis=0)  # (d,m)
+        Q_no_i = pref * suf  # (m_q, m, d)
+        acc = (w[:, None, None] * Q_no_i).sum(axis=0)  # (m, d)
         return K * acc
 
     def phi_matrix_logspace(self, K: np.ndarray, m_q: int, eps: float = 1e-12) -> np.ndarray:
-        """Compute Phi (d,m) using log-space shared product.
+        """Compute Phi (m,d) using log-space shared product.
 
-        This is memory-lean in the shared product, but still returns Phi (d,m).
+        This is memory-lean in the shared product, but still returns Phi (m,d).
         """
         K = np.asarray(K, dtype=np.float64)
-        d, m = K.shape
+        m, d = K.shape
 
         x, w = _gauss_legendre_01_numpy(m_q, dtype=np.float64)
 
@@ -75,17 +75,17 @@ class ProductGamesShapleyNumpy:
         sign_P = np.ones((m_q, m), dtype=np.float64)
 
         for j in range(d):
-            t = 1.0 + np.outer(x, K[j, :])  # (m_q,m)
+            t = 1.0 + np.outer(x, K[:, j])  # (m_q,m)
             sign_P *= np.sign(t)
             log_abs_P += np.log(np.maximum(np.abs(t), eps), dtype=np.float64)
 
-        Qint = np.empty((d, m), dtype=np.float64)
+        Qint = np.empty((m, d), dtype=np.float64)
         wa = w[:, None]
         for i in range(d):
-            denom = 1.0 + np.outer(x, K[i, :])  # (m_q,m)
+            denom = 1.0 + np.outer(x, K[:, i])  # (m_q,m)
             integrand_sign = sign_P * np.sign(denom)
             integrand_log = log_abs_P - np.log(np.maximum(np.abs(denom), eps), dtype=np.float64)
-            Qint[i, :] = (wa * (integrand_sign * np.exp(integrand_log))).sum(axis=0)
+            Qint[:, i] = (wa * (integrand_sign * np.exp(integrand_log))).sum(axis=0)
 
         return K * Qint
 
@@ -94,7 +94,7 @@ class ProductGamesShapleyJax:
     """
     Product-game Shapley factors in JAX.
 
-    Returns Phi (d,m) in NumPy format.
+    Returns Phi (m,d) in NumPy format.
     """
 
     def __init__(self):
@@ -104,17 +104,18 @@ class ProductGamesShapleyJax:
     @staticmethod
     @jax.jit
     def _phi_prefix_core(K, x, w):
-        B = 1.0 + x[:, None, None] * K[None, :, :]  # (m_q,d,m)
-        pref = lax.cumprod(B, axis=1)
+        # K: (m, d)
+        B = 1.0 + x[:, None, None] * K[None, :, :]  # (m_q, m, d)
+        pref = lax.cumprod(B, axis=2)
         pref = jnp.concatenate(
-            [jnp.ones((B.shape[0], 1, B.shape[2]), dtype=B.dtype), pref[:, :-1, :]], axis=1
+            [jnp.ones((B.shape[0], B.shape[1], 1), dtype=B.dtype), pref[:, :, :-1]], axis=2
         )
-        suf = lax.cumprod(B[:, ::-1, :], axis=1)[:, ::-1, :]
+        suf = lax.cumprod(B[:, :, ::-1], axis=2)[:, :, ::-1]
         suf = jnp.concatenate(
-            [suf[:, 1:, :], jnp.ones((B.shape[0], 1, B.shape[2]), dtype=B.dtype)], axis=1
+            [suf[:, :, 1:], jnp.ones((B.shape[0], B.shape[1], 1), dtype=B.dtype)], axis=2
         )
         Q = pref * suf
-        acc = (w[:, None, None] * Q).sum(axis=0)  # (d,m)
+        acc = (w[:, None, None] * Q).sum(axis=0)  # (m, d)
         return K * acc
 
     def phi_matrix_prefix_scan(self, K: np.ndarray, m_q: int) -> np.ndarray:
@@ -143,31 +144,36 @@ class ProductGamesShapleyJax:
     @staticmethod
     @jax.jit
     def _phi_logspace_core(K, x, w, eps):
-        x = x[:, None]  # (m_q,1)
-        w = w[:, None]  # (m_q,1)
-        d, m = K.shape
+        # K: (m, d)
+        x = x[:, None]  # (m_q, 1)
+        w = w[:, None]  # (m_q, 1)
+        m, d = K.shape
 
         def scan_step(carry, k_j):
+            # k_j: (m,) — column j of K
             log_abs_P, sign_P = carry
             t = 1.0 + x * k_j[None, :]
             sign_P = sign_P * jnp.sign(t)
             log_abs_P = log_abs_P + jnp.log(jnp.maximum(jnp.abs(t), eps))
             return (log_abs_P, sign_P), None
 
+        # Scan over d columns of K
         init = (
             jnp.zeros((x.shape[0], m), K.dtype),
             jnp.ones((x.shape[0], m), K.dtype),
         )
-        (log_abs_P, sign_P), _ = lax.scan(scan_step, init, K)
+        (log_abs_P, sign_P), _ = lax.scan(scan_step, init, K.T)  # scan over (d, m)
 
         def per_feature(k_i):
+            # k_i: (m,) — column i of K
             denom = 1.0 + x * k_i[None, :]
             integrand_sign = sign_P * jnp.sign(denom)
             integrand_log = log_abs_P - jnp.log(jnp.maximum(jnp.abs(denom), eps))
             Qint = jnp.sum(w * (integrand_sign * jnp.exp(integrand_log)), axis=0)  # (m,)
             return k_i * Qint  # (m,)
 
-        return jax.vmap(per_feature, in_axes=0)(K)  # (d,m)
+        # vmap over d columns, result (d, m), then transpose to (m, d)
+        return jax.vmap(per_feature, in_axes=0)(K.T).T
 
     def phi_matrix_logspace(self, K: np.ndarray, m_q: int, eps: float = 1e-100) -> np.ndarray:
         K = np.asarray(K)

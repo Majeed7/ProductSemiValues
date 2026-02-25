@@ -31,20 +31,20 @@ def phi_fn(request):
 def _check_single_game(phi_fn, a):
     a = np.asarray(a, dtype=np.float64)
     d = len(a)
-    K = (a - 1.0).reshape(d, 1)
+    K = (a - 1.0).reshape(1, d)
     m_q = max(1, (d + 1) // 2)
 
     phi = phi_fn(K, m_q)
-    assert phi.shape == (d, 1)
+    assert phi.shape == (1, d)
 
     expected = naive_shapley(a)
-    np.testing.assert_allclose(phi[:, 0], expected, atol=ATOL)
+    np.testing.assert_allclose(phi[0, :], expected, atol=ATOL)
 
 
 def test_empty(phi_fn):
-    K = np.empty((0, 1), dtype=np.float64)
+    K = np.empty((1, 0), dtype=np.float64)
     phi = phi_fn(K, m_q=1)
-    assert phi.shape == (0, 1)
+    assert phi.shape == (1, 0)
 
 
 def test_simple(phi_fn):
@@ -64,10 +64,10 @@ def test_random(phi_fn):
 def _check_sum_property(phi_fn, m_q, a):
     a = np.asarray(a, dtype=np.float64)
     d = len(a)
-    K = (a - 1.0).reshape(d, 1)
+    K = (a - 1.0).reshape(1, d)
 
     phi = phi_fn(K, m_q)
-    phi_sum = phi[:, 0].sum()
+    phi_sum = phi[0, :].sum()
     expected_sum = np.prod(a) - 1.0
     np.testing.assert_allclose(phi_sum, expected_sum, rtol=1e-6)
 

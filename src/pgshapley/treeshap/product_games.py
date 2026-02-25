@@ -24,6 +24,11 @@ class _PreparedTree:
     # (n_leaves, n_outputs) coefficient alpha = R_empty (already includes tree weight)
     leaf_alpha: np.ndarray
 
+    # Precomputed Gauss-Legendre quadrature nodes/weights for this tree
+    quad_x: np.ndarray   # (m_q,) nodes on [0,1]
+    quad_w: np.ndarray   # (m_q,) weights
+    quad_log_w: np.ndarray  # (m_q,1,1) log(weights), reshaped for broadcasting
+
 
 @dataclass
 class PreparedProductGamesModel(PreparedModel):
@@ -196,6 +201,13 @@ class ProductGamesTreeShapBackend(TreeShapBackend):
 
             expected_value += leaf_alpha.sum(axis=0)
 
+            # Precompute Gauss-Legendre quadrature for this tree's D
+            m_q = self._m_q_for_tree(max_d)
+            qx, qw = np.polynomial.legendre.leggauss(m_q)
+            qx = (0.5 * (qx + 1.0)).astype(np.float64)
+            qw = (0.5 * qw).astype(np.float64)
+            log_qw = np.log(qw).reshape(-1, 1, 1)  # (m_q, 1, 1)
+
             prepared_trees.append(
                 _PreparedTree(
                     max_path_features=max_d,
@@ -204,6 +216,9 @@ class ProductGamesTreeShapBackend(TreeShapBackend):
                     leaf_upper=upper,
                     leaf_inv_weight_prod=invw,
                     leaf_alpha=leaf_alpha,
+                    quad_x=qx,
+                    quad_w=qw,
+                    quad_log_w=log_qw,
                 )
             )
 
@@ -245,13 +260,16 @@ class ProductGamesTreeShapBackend(TreeShapBackend):
             D = pt.max_path_features
             if D == 0:
                 continue
-            m_q = self._m_q_for_tree(D)
 
             feat_ids_all = pt.leaf_feature_ids  # (n_leaves, D)
             lower_all = pt.leaf_lower
             upper_all = pt.leaf_upper
             invw_all = pt.leaf_inv_weight_prod
             alpha_all = pt.leaf_alpha  # (n_leaves, n_outputs)
+
+            # Precomputed quadrature
+            qx = pt.quad_x      # (m_q,)
+            log_qw = pt.quad_log_w  # (m_q, 1, 1)
 
             n_leaves = feat_ids_all.shape[0]
             bs = self._batch_size if self._batch_size and self._batch_size > 0 else n_leaves
@@ -275,26 +293,29 @@ class ProductGamesTreeShapBackend(TreeShapBackend):
                     x_vals = x[gather_ids]  # (b, D)
 
                     satisfied = (x_vals > lower) & (x_vals <= upper)
-                    # For padding entries, invw==1, bounds==(-inf, inf), so satisfied is True.
-
                     q = invw * satisfied.astype(np.float64)  # (b, D)
-                    # But for padding, q should be 1 (not invw * True == 1) good.
 
-                    # However, for features not present (feat_id == -1), we want q=1.
-                    # Our construction ensures q==1 there because invw==1 and bounds are wide.
+                    K = q - 1.0  # (b, D)
 
-                    K = (q - 1.0).T  # (D, b)
-                    Phi = self._phi_matrix_fn(K, m_q)  # (D, b)
+                    # Logspace phi_matrix with precomputed quadrature.
+                    # B > 0 always: q >= 0 so K >= -1, and qx in (0,1),
+                    # hence B = 1 + qx*K > 0.  No sign tracking needed.
+                    B = 1.0 + qx[:, None, None] * K[None, :, :]  # (m_q, b, D)
+
+                    log_B = np.log(B)  # (m_q, b, D)
+                    total_log = log_B.sum(axis=2, keepdims=True)  # (m_q, b, 1)
+
+                    # Fold quadrature weights into log space, exp + sum in one step
+                    weighted_total = log_qw + total_log  # (m_q, b, 1)
+                    Phi = K * np.exp(weighted_total - log_B).sum(axis=0)  # (b, D)
 
                     # Multiply by per-leaf alpha (vector)
-                    contrib = Phi[:, :, None] * alpha[None, :, :]  # (D, b, n_outputs)
+                    contrib = Phi[:, :, None] * alpha[:, None, :]  # (b, D, n_outputs)
 
-                    # Scatter-add to feature dimension
-                    for k in range(D):
-                        f_idx = feat_ids[:, k]
-                        mask = f_idx >= 0
-                        if not np.any(mask):
-                            continue
-                        np.add.at(phi_s, f_idx[mask], contrib[k, mask, :])
+                    # Scatter-add to feature dimension (vectorized)
+                    flat_idx = feat_ids.ravel()  # (b*D,)
+                    mask = flat_idx >= 0
+                    flat_contrib = contrib.reshape(-1, contrib.shape[2])  # (b*D, n_outputs)
+                    np.add.at(phi_s, flat_idx[mask], flat_contrib[mask])
 
         return out

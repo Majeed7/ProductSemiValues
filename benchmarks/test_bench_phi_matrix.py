@@ -26,7 +26,7 @@ def _make_K(d, seed=0):
     rng = np.random.default_rng(seed)
     c = 5.0 / np.sqrt(d)
     a = np.exp(rng.uniform(-c, c, size=d))
-    return (a - 1.0).reshape(d, 1)
+    return (a - 1.0).reshape(1, d)
 
 
 @pytest.mark.parametrize("d", [10, 50, 100, 500, 1000])
