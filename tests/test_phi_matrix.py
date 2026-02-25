@@ -1,16 +1,12 @@
-import sys
-import os
-
 import pytest
 import numpy as np
 
-# TODO(gritukan): Remove this after we switch to better structure.
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from pgshapley.product_games.shapley import ProductGamesShapleyNumpy, ProductGamesShapleyJax, JAX_AVAILABLE
 
-import jax
-jax.config.update("jax_enable_x64", True)
+if JAX_AVAILABLE:
+    import jax
 
-from product_games_shapley import ProductGamesShapleyNumpy, ProductGamesShapleyJax, JAX_AVAILABLE
+    jax.config.update("jax_enable_x64", True)
 
 from tests.naive_shapley import naive_shapley
 

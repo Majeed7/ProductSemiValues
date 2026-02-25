@@ -1,16 +1,10 @@
-import sys
-import os
-
 import pytest
 import numpy as np
-
-# TODO(gritukan): Remove this after we switch to better structure.
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import jax
 jax.config.update("jax_enable_x64", True)
 
-from product_games_shapley import ProductGamesShapleyNumpy, ProductGamesShapleyJax, JAX_AVAILABLE
+from pgshapley.product_games.shapley import ProductGamesShapleyNumpy, ProductGamesShapleyJax, JAX_AVAILABLE
 
 
 def _phi_matrix_methods():
