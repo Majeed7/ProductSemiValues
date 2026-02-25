@@ -174,7 +174,9 @@ class ProductKernelLocalExplainer:
         m_q   : Gauss–Legendre nodes (if None, uses ceil(d/2) for exactness on degree d-1)
         """
         kernel_vectors = self.compute_kernel_vectors(self.X_train, x, gamma)
-        K = np.asarray(kernel_vectors, dtype=np.float64) - 1.0
+        # kernel_vectors is a list of d arrays each of shape (n,)
+        # Stack to (n, d) for the (m, d) convention
+        K = np.stack(kernel_vectors, axis=1).astype(np.float64) - 1.0  # (n, d)
         alpha = np.asarray(self.alpha, dtype=np.float64)
         d = self.d
 
@@ -183,28 +185,28 @@ class ProductKernelLocalExplainer:
 
         ## log space Gauss–Legendre backends
         elif method == 'logspace_numpy':
-            phi = ProductGamesShapleyNumpy().phi_matrix_logspace(K, m_q)
-            out = (phi * alpha[None, :]).sum(axis=1)
-            
+            phi = ProductGamesShapleyNumpy().phi_matrix_logspace(K, m_q)  # (n, d)
+            out = (phi * alpha[:, None]).sum(axis=0)  # (d,)
+
             return out
 
         elif method == 'logspace_jax':
-            phi = ProductGamesShapleyJax().phi_matrix_logspace(K, m_q)
-            out = (phi * alpha[None, :]).sum(axis=1)
-            
+            phi = ProductGamesShapleyJax().phi_matrix_logspace(K, m_q)  # (n, d)
+            out = (phi * alpha[:, None]).sum(axis=0)  # (d,)
+
             return out
 
         ## prefix /suffix Gauss Legendre backends
         elif method == 'prefix_scan_numpy':
-            phi = ProductGamesShapleyNumpy().phi_matrix_prefix_scan(K, m_q)
-            out = (phi * alpha[None, :]).sum(axis=1)
-            
+            phi = ProductGamesShapleyNumpy().phi_matrix_prefix_scan(K, m_q)  # (n, d)
+            out = (phi * alpha[:, None]).sum(axis=0)  # (d,)
+
             return out
 
         elif method == 'prefix_scan_jax':
-            phi = ProductGamesShapleyJax().phi_matrix_prefix_scan(K, m_q)
-            out = (phi * alpha[None, :]).sum(axis=1)
-            
+            phi = ProductGamesShapleyJax().phi_matrix_prefix_scan(K, m_q)  # (n, d)
+            out = (phi * alpha[:, None]).sum(axis=0)  # (d,)
+
             return out
         
         else:

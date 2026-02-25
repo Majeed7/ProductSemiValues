@@ -7,6 +7,16 @@ import numpy as np
 
 from .base import PreparedModel, TreeShapBackend
 from .unified import UnifiedEnsemble, UnifiedTree
+from pgshapley._cpp_ext import HAS_CPP_EXT
+
+
+@dataclass
+class _BatchScatterPlan:
+    """Precomputed scatter plan for a batch of leaves."""
+    # Single gather index: maps flat_contrib -> sorted-by-feature order (valid only)
+    gather_index: np.ndarray    # int32, combined valid_mask + sort_order
+    group_starts: np.ndarray    # int32, reduceat offsets
+    unique_feat_ids: np.ndarray # int32, unique feature ids (one per group)
 
 
 @dataclass
@@ -21,8 +31,19 @@ class _PreparedTree:
     leaf_upper: np.ndarray  # float64
     leaf_inv_weight_prod: np.ndarray  # float64
 
+    # Precomputed gather_ids = np.maximum(leaf_feature_ids, 0), shape (n_leaves, D)
+    leaf_gather_ids: np.ndarray  # int32
+
     # (n_leaves, n_outputs) coefficient alpha = R_empty (already includes tree weight)
     leaf_alpha: np.ndarray
+
+    # Precomputed Gauss-Legendre quadrature nodes/weights for this tree
+    quad_x: np.ndarray   # (m_q,) nodes on [0,1]
+    quad_w: np.ndarray   # (m_q,) weights
+    quad_log_w: np.ndarray  # (m_q,1,1) log(weights), reshaped for broadcasting
+
+    # Precomputed scatter plans per batch
+    scatter_plans: List[_BatchScatterPlan]
 
 
 @dataclass
@@ -196,6 +217,38 @@ class ProductGamesTreeShapBackend(TreeShapBackend):
 
             expected_value += leaf_alpha.sum(axis=0)
 
+            # Precompute gather_ids (clamp -1 to 0 for safe indexing)
+            gather_ids = np.maximum(feat_ids, 0)
+
+            # Precompute Gauss-Legendre quadrature for this tree's D
+            m_q = self._m_q_for_tree(max_d)
+            qx, qw = np.polynomial.legendre.leggauss(m_q)
+            qx = (0.5 * (qx + 1.0)).astype(np.float64)
+            qw = (0.5 * qw).astype(np.float64)
+            log_qw = np.log(qw).reshape(-1, 1, 1)  # (m_q, 1, 1)
+
+            # Precompute scatter plans per batch
+            bs = self._batch_size if self._batch_size and self._batch_size > 0 else n_leaves
+            scatter_plans: List[_BatchScatterPlan] = []
+            for start in range(0, n_leaves, bs):
+                end = min(n_leaves, start + bs)
+                batch_feat_ids = feat_ids[start:end]  # (b, D)
+                flat_idx = batch_feat_ids.ravel()      # (b*D,)
+                valid_positions = np.flatnonzero(flat_idx >= 0)
+                valid_ids = flat_idx[valid_positions]
+                sort_order = np.argsort(valid_ids, kind='mergesort')
+                sorted_ids = valid_ids[sort_order]
+                # Combined gather: flat_contrib[gather_index] gives sorted valid contribs
+                gather_index = valid_positions[sort_order]
+                # Find group boundaries
+                changes = np.concatenate([[0], np.flatnonzero(np.diff(sorted_ids) != 0) + 1])
+                unique_ids = sorted_ids[changes]
+                scatter_plans.append(_BatchScatterPlan(
+                    gather_index=gather_index.astype(np.int32),
+                    group_starts=changes.astype(np.int32),
+                    unique_feat_ids=unique_ids.astype(np.int32),
+                ))
+
             prepared_trees.append(
                 _PreparedTree(
                     max_path_features=max_d,
@@ -203,7 +256,12 @@ class ProductGamesTreeShapBackend(TreeShapBackend):
                     leaf_lower=lower,
                     leaf_upper=upper,
                     leaf_inv_weight_prod=invw,
+                    leaf_gather_ids=gather_ids,
                     leaf_alpha=leaf_alpha,
+                    quad_x=qx,
+                    quad_w=qw,
+                    quad_log_w=log_qw,
+                    scatter_plans=scatter_plans,
                 )
             )
 
@@ -220,6 +278,37 @@ class ProductGamesTreeShapBackend(TreeShapBackend):
             return int(self._m_q_user)
         return max(1, (int(D) + 1) // 2)
 
+    def _explain_cpp(self, X: np.ndarray, n_trees: int) -> np.ndarray:
+        """Explain using the C++ extension (fast path)."""
+        from pgshapley._cpp_ext import PreparedTreeData, explain_trees
+
+        ensemble = self.prepared.ensemble
+        n_samples = X.shape[0]
+        out = np.zeros((n_samples, ensemble.n_features, ensemble.n_outputs), dtype=np.float64)
+
+        cpp_trees = []
+        for t in range(n_trees):
+            pt = self.prepared.trees[t]
+            td = PreparedTreeData()
+            td.feature_ids = np.ascontiguousarray(pt.leaf_feature_ids)
+            td.lower = np.ascontiguousarray(pt.leaf_lower)
+            td.upper = np.ascontiguousarray(pt.leaf_upper)
+            td.invw = np.ascontiguousarray(pt.leaf_inv_weight_prod)
+            td.alpha = np.ascontiguousarray(pt.leaf_alpha)
+            td.quad_x = np.ascontiguousarray(pt.quad_x)
+            td.quad_log_w = np.ascontiguousarray(pt.quad_log_w.ravel())
+            td.n_leaves = pt.leaf_feature_ids.shape[0]
+            td.max_d = pt.max_path_features
+            cpp_trees.append(td)
+
+        explain_trees(
+            np.ascontiguousarray(X, dtype=np.float64),
+            out,
+            cpp_trees,
+            n_trees,
+        )
+        return out
+
     def explain(self, X: np.ndarray, *, tree_limit: Optional[int] = None) -> np.ndarray:
         if self.prepared is None:
             raise RuntimeError("Backend is not prepared. Call prepare() first.")
@@ -233,68 +322,81 @@ class ProductGamesTreeShapBackend(TreeShapBackend):
                 f"X has {X.shape[1]} features but model has {ensemble.n_features}."
             )
 
-        n_samples = X.shape[0]
-        out = np.zeros((n_samples, ensemble.n_features, ensemble.n_outputs), dtype=np.float64)
-
         n_trees = len(self.prepared.trees)
         if tree_limit is not None:
             n_trees = min(n_trees, int(tree_limit))
+
+        if HAS_CPP_EXT:
+            return self._explain_cpp(X, n_trees)
+
+        n_samples = X.shape[0]
+        out = np.zeros((n_samples, ensemble.n_features, ensemble.n_outputs), dtype=np.float64)
 
         for t in range(n_trees):
             pt = self.prepared.trees[t]
             D = pt.max_path_features
             if D == 0:
                 continue
-            m_q = self._m_q_for_tree(D)
 
             feat_ids_all = pt.leaf_feature_ids  # (n_leaves, D)
             lower_all = pt.leaf_lower
             upper_all = pt.leaf_upper
             invw_all = pt.leaf_inv_weight_prod
+            gather_ids_all = pt.leaf_gather_ids  # (n_leaves, D)
             alpha_all = pt.leaf_alpha  # (n_leaves, n_outputs)
+
+            # Precomputed quadrature
+            qx = pt.quad_x      # (m_q,)
+            log_qw = pt.quad_log_w  # (m_q, 1, 1)
 
             n_leaves = feat_ids_all.shape[0]
             bs = self._batch_size if self._batch_size and self._batch_size > 0 else n_leaves
+            scatter_plans = pt.scatter_plans
 
             for s in range(n_samples):
                 x = X[s]
                 phi_s = out[s]  # (n_features, n_outputs)
 
+                batch_idx = 0
                 for start in range(0, n_leaves, bs):
                     end = min(n_leaves, start + bs)
 
-                    feat_ids = feat_ids_all[start:end]  # (b, D)
                     lower = lower_all[start:end]
                     upper = upper_all[start:end]
                     invw = invw_all[start:end]
+                    gather_ids = gather_ids_all[start:end]  # (b, D)
                     alpha = alpha_all[start:end]  # (b, n_outputs)
-                    b = end - start
+                    plan = scatter_plans[batch_idx]
 
-                    # Gather feature values for each (leaf, slot)
-                    gather_ids = np.where(feat_ids >= 0, feat_ids, 0)
+                    # Gather feature values using precomputed ids
                     x_vals = x[gather_ids]  # (b, D)
 
                     satisfied = (x_vals > lower) & (x_vals <= upper)
-                    # For padding entries, invw==1, bounds==(-inf, inf), so satisfied is True.
+                    q = invw * satisfied  # (b, D)
 
-                    q = invw * satisfied.astype(np.float64)  # (b, D)
-                    # But for padding, q should be 1 (not invw * True == 1) good.
+                    K = q - 1.0  # (b, D)
 
-                    # However, for features not present (feat_id == -1), we want q=1.
-                    # Our construction ensures q==1 there because invw==1 and bounds are wide.
+                    # Logspace phi_matrix with precomputed quadrature.
+                    # B > 0 always: q >= 0 so K >= -1, and qx in (0,1),
+                    # hence B = 1 + qx*K > 0.  No sign tracking needed.
+                    # Use log1p for better numerical precision.
+                    qxK = qx[:, None, None] * K[None, :, :]  # (m_q, b, D)
+                    log_B = np.log1p(qxK)  # (m_q, b, D)
+                    total_log = log_B.sum(axis=2, keepdims=True)  # (m_q, b, 1)
 
-                    K = (q - 1.0).T  # (D, b)
-                    Phi = self._phi_matrix_fn(K, m_q)  # (D, b)
+                    # Fold quadrature weights into log space, exp + sum in one step
+                    weighted_total = log_qw + total_log  # (m_q, b, 1)
+                    Phi = K * np.exp(weighted_total - log_B).sum(axis=0)  # (b, D)
 
                     # Multiply by per-leaf alpha (vector)
-                    contrib = Phi[:, :, None] * alpha[None, :, :]  # (D, b, n_outputs)
+                    contrib = Phi[:, :, None] * alpha[:, None, :]  # (b, D, n_outputs)
 
-                    # Scatter-add to feature dimension
-                    for k in range(D):
-                        f_idx = feat_ids[:, k]
-                        mask = f_idx >= 0
-                        if not np.any(mask):
-                            continue
-                        np.add.at(phi_s, f_idx[mask], contrib[k, mask, :])
+                    # Scatter-add using precomputed sort+reduceat plan
+                    flat_contrib = contrib.reshape(-1, contrib.shape[2])  # (b*D, n_outputs)
+                    sorted_contrib = flat_contrib[plan.gather_index]  # (n_valid_sorted, n_outputs)
+                    grouped = np.add.reduceat(sorted_contrib, plan.group_starts, axis=0)  # (n_groups, n_outputs)
+                    phi_s[plan.unique_feat_ids] += grouped
+
+                    batch_idx += 1
 
         return out
