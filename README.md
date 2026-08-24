@@ -135,6 +135,21 @@ print(phi.shape)          # (5,)
 
 **Supported kernel backends (`method`):** `logspace_numpy`, `logspace_jax`, `prefix_scan_numpy`, `prefix_scan_jax`.
 
+## Tutorials
+
+The [`tutorials/`](tutorials/) directory contains two executable Jupyter
+notebooks that derive the method from the paper, connect the mathematics to
+the implementation, and include naive exact baselines, correctness checks,
+quadrature-convergence examples, and measured timing comparisons:
+
+- [Tree-model tutorial](tutorials/tree_models.ipynb) — path-dependent TreeSHAP
+  for a scikit-learn decision tree versus exhaustive coalition enumeration.
+- [Product-kernel tutorial](tutorials/kernel_methods.ipynb) — local Shapley
+  values for RBF Kernel Ridge versus exhaustive product-game enumeration.
+
+See the [tutorial guide](tutorials/README.md) for installation and launch
+instructions.
+
 ## Running Tests
 
 ```bash
