@@ -82,11 +82,21 @@ class QuadratureTreeShapBackend(TreeShapBackend):
         by side so they can be benchmarked head-to-head.
     """
 
-    def __init__(self, *, m_q: Optional[int] = None, use_cpp: bool = True):
+    def __init__(
+        self,
+        *,
+        m_q: Optional[int] = None,
+        use_cpp: bool = True,
+        device: str = "cpu",
+    ):
         super().__init__()
         self._m_q_user = m_q
         self._use_cpp = bool(use_cpp)
-        if self._use_cpp and not HAS_CPP_EXT:
+        self._device = str(device).lower()
+        self._cuda_solver = None
+        if self._device not in ("cpu", "cuda"):
+            raise ValueError("device must be either 'cpu' or 'cuda'")
+        if self._device == "cpu" and self._use_cpp and not HAS_CPP_EXT:
             import warnings
             warnings.warn(
                 "quadrashap: use_cpp=True requested but the C++ extension "
@@ -179,6 +189,10 @@ class QuadratureTreeShapBackend(TreeShapBackend):
             trees=prepared_trees,
         )
         self.prepared = out
+        if self._device == "cuda":
+            from .cuda import CudaQuadratureTreeSolver
+
+            self._cuda_solver = CudaQuadratureTreeSolver(out)
         return out
 
     def explain(self, X: np.ndarray, *, tree_limit: Optional[int] = None) -> np.ndarray:
@@ -196,6 +210,13 @@ class QuadratureTreeShapBackend(TreeShapBackend):
 
         n_trees_total = len(self.prepared.trees)
         n_trees = n_trees_total if tree_limit is None else min(n_trees_total, int(tree_limit))
+
+        if self._device == "cuda":
+            if n_trees != n_trees_total:
+                raise NotImplementedError(
+                    "tree_limit is not yet supported by the CUDA backend"
+                )
+            return self._cuda_solver.explain(X)
 
         if self._use_cpp and HAS_CPP_EXT:
             return self._explain_cpp(X, n_trees)

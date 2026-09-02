@@ -63,6 +63,7 @@ class TreeExplainer:
         self.batch_size = deprecated_options.pop("batch_size", 256)
         self.m_q = deprecated_options.pop("m_q", None)
         self.use_cpp = deprecated_options.pop("use_cpp", True)
+        self.device = deprecated_options.pop("device", "cpu")
 
         if model_output != "raw":
             raise NotImplementedError(
@@ -92,7 +93,7 @@ class TreeExplainer:
             )
         elif solver == "quadrature_tree":
             self._backend = QuadratureTreeShapBackend(
-                m_q=self.m_q, use_cpp=self.use_cpp
+                m_q=self.m_q, use_cpp=self.use_cpp, device=self.device
             )
         else:
             raise ValueError(
@@ -161,4 +162,3 @@ class TreeExplainer:
     def __call__(self, X: np.ndarray, *args, **kwargs):
         # SHAP's explainers are callable; return shap_values.
         return self.shap_values(X, *args, **kwargs)
-

@@ -69,7 +69,25 @@ pip install pytest pytest-benchmark scikit-learn shap
 > - The build system attempts to compile the optional C++ extension if a compatible compiler is detected. If compilation fails, installation falls back gracefully to a pure-Python build.
 > - JAX is optional for some backends, but `jax` and `jaxlib` are currently declared as core dependencies in `pyproject.toml`.
 
+For the CUDA tree backend, install the GPU extra matching a CUDA 12 runtime:
+
+```bash
+uv sync --extra gpu --group testing
+```
+
 ## Quick Start
+
+### Drop-in replacement for SHAP
+
+```python
+# import shap
+# explainer = shap.TreeExplainer(model)
+from quadrashap import TreeExplainer
+
+explainer = TreeExplainer(model)
+phi = explainer.shap_values(X_test)
+base_value = explainer.expected_value
+```
 
 ### Tree models
 
@@ -106,6 +124,21 @@ print(explainer.expected_value)
 | `backend_method` | `"numpy_prefix_scan"`, `"numpy_logspace"`, `"jax_prefix_scan"`, `"jax_logspace"` |
 | `m_q` | Number of quadrature nodes (integer) |
 | `use_cpp` | `True` / `False` (quadrature-tree backend only) |
+| `device` | `"cpu"` / `"cuda"` (quadrature-tree backend only) |
+
+The CUDA path uses the same exact edge-telescoping algorithm as the native
+quadrature-tree solver.  It keeps model data resident, streams samples through
+sibling-paired warps, precomputes quadrature factors, and converts the forward
+node products into subtree sums in place; no leaf-prefix tensor is allocated.
+
+```python
+explainer = TreeExplainer(
+    model,
+    tree_solver="quadrature_tree",
+    device="cuda",
+)
+phi = explainer.shap_values(X_test)
+```
 
 **Current limitations:**
 
@@ -201,15 +234,37 @@ Evaluates tree and kernel explainers on TF-IDF text-classification setups. Outpu
 
 > Additional dependencies may be required: `datasets`, `pandas`, `matplotlib`, `scipy`, `joblib`, and optionally `optuna`.
 
+### 4. GPU TreeSHAP benchmark
+
+```bash
+uv sync --extra gpu --extra benchmarks --group testing
+python benchmarks/gpu_treeshap_bench.py
+```
+
+This reproduces the synthetic and text tree comparisons with
+QuadraSHAP-GPU and SHAP's CUDA `GPUTreeExplainer`. Outputs are written to
+`benchmarks/results/gpu/`. The GPUTreeSHAP baseline requires SHAP to be built
+from source with its optional CUDA extension.
+The worker mode accepts `--n-samples` and repeats cached inputs as necessary,
+which can be used to reproduce the saved batch-scaling experiment (batch
+sizes 1 through 32,000).
+Large scalar batches use exact FP64 checkpointed treelets: only component-root
+state is stored in global memory, while 7- or 15-node connected components are
+reconstructed in shared memory. The compact internal-node kernel remains the
+lower-latency path below the measured 1,536-row crossover.
+
 ## Precomputed Results
 
 Saved benchmark artifacts are included for inspection without rerunning experiments:
 
 - `benchmarks/results/mq/` — convergence CSVs and figures for the quadrature-node sweep
 - `benchmarks/results/text/` — tables and plots from the text-classification benchmark
+- `benchmarks/results/gpu/` — GPU tables and optimized batch-scaling results
 
 ## Implementation Notes
 
 - The package uses `scikit-build-core` and `pybind11` for the optional C++ extension.
 - Tree explanations are computed via an internal unified tree representation converted from scikit-learn models.
+- CUDA tree explanations use ragged per-tree quadrature checkpoints and reuse
+  their feature-partial workspace after every treelet depth.
 - Kernel explainers use Gauss-Legendre quadrature with a configurable number of nodes `m_q`; when unset, a default is chosen based on the feature dimension.
